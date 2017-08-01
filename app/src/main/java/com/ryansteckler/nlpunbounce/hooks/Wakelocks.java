@@ -9,6 +9,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.SystemClock;
@@ -16,6 +18,7 @@ import android.os.SystemClock;
 import com.ryansteckler.nlpunbounce.ActivityReceiver;
 import com.ryansteckler.nlpunbounce.XposedReceiver;
 import com.ryansteckler.nlpunbounce.models.InterimEvent;
+import com.ryansteckler.nlpunbounce.models.LockFreePreferences;
 import com.ryansteckler.nlpunbounce.models.UnbounceStatsCollection;
 
 import java.io.BufferedReader;
@@ -54,8 +57,12 @@ public class Wakelocks implements IXposedHookLoadPackage {
     private final BroadcastReceiver mBroadcastReceiver = new XposedReceiver();
     private boolean mRegisteredRecevier = false;
 
-    XSharedPreferences m_prefs;
+    private XSharedPreferences m_prefs;
+    private SharedPreferences mLockFreePrefs;
     public static HashMap<IBinder, InterimEvent> mCurrentWakeLocks;
+
+    private boolean mAsyncHandlerActive = false;
+    private final Object mAsyncHandlerMonitor = new Object();
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
@@ -63,8 +70,7 @@ public class Wakelocks implements IXposedHookLoadPackage {
         if (lpparam.packageName.equals("android")) {
 
             m_prefs = new XSharedPreferences("com.ryansteckler.nlpunbounce");
-            m_prefs.reload();
-
+            reloadSettings();
             defaultLog("Version " + VERSION);
 
             mCurrentWakeLocks = new HashMap<IBinder, InterimEvent>();
@@ -81,10 +87,15 @@ public class Wakelocks implements IXposedHookLoadPackage {
         }
     }
 
+    private void reloadSettings() {
+        m_prefs.reload();
+        mLockFreePrefs = new LockFreePreferences(m_prefs.getAll());
+    }
+
 
     private void resetFilesIfNeeded(Context context) {
         //Get the version number and compare it to our app version.
-        String lastVersion = m_prefs.getString("file_version", "0");
+        String lastVersion = mLockFreePrefs.getString("file_version", "0");
         if (!lastVersion.equals(FILE_VERSION)) {
             //Reset stats
             defaultLog("Resetting stat files on version upgrade.");
@@ -195,7 +206,7 @@ public class Wakelocks implements IXposedHookLoadPackage {
 
     private void hookServices(LoadPackageParam lpparam) {
 
-        boolean isServicBlockingEnabled = m_prefs.getBoolean("enable_service_block", true);
+        boolean isServicBlockingEnabled = mLockFreePrefs.getBoolean("enable_service_block", true);
 
         defaultLog("Service Blocking Status: " + isServicBlockingEnabled);
 
@@ -408,7 +419,7 @@ public class Wakelocks implements IXposedHookLoadPackage {
         int callingUid = (Integer) param.args[4];
 
         String prefName = "service_" + serviceName + "_enabled";
-        if (m_prefs.getBoolean(prefName, false)) {
+        if (mLockFreePrefs.getBoolean(prefName, false)) {
 
             param.setResult(null);
             recordServiceBlock(param, serviceName, callingUid);
@@ -427,11 +438,11 @@ public class Wakelocks implements IXposedHookLoadPackage {
 
         //If we're blocking this wakelock
         String prefName = "wakelock_" + wakeLockName + "_enabled";
-        boolean block = m_prefs.getBoolean(prefName, false);
+        boolean block = mLockFreePrefs.getBoolean(prefName, false);
         int overrideSeconds = -1;
         if (!block) {
             //See if there is a wildcard block on this
-            Set<String> wakelockWildcards = m_prefs.getStringSet("wakelock_regex_set", null);
+            Set<String> wakelockWildcards = mLockFreePrefs.getStringSet("wakelock_regex_set", null);
             if (wakelockWildcards != null) {
                 //For each wildcard block
                 for (String wildcard : wakelockWildcards) {
@@ -452,7 +463,7 @@ public class Wakelocks implements IXposedHookLoadPackage {
             if (overrideSeconds != -1) {
                 collectorMaxFreq = overrideSeconds;
             } else {
-                collectorMaxFreq = m_prefs.getLong("wakelock_" + wakeLockName + "_seconds", 240);
+                collectorMaxFreq = mLockFreePrefs.getLong("wakelock_" + wakeLockName + "_seconds", 240);
             }
             collectorMaxFreq *= 1000; //convert to ms
 
@@ -581,16 +592,10 @@ public class Wakelocks implements IXposedHookLoadPackage {
         }
     }
 
-    private void handleAlarm(XC_MethodHook.MethodHookParam param, ArrayList<Object> triggers) {
+    private void handleAlarm(final XC_MethodHook.MethodHookParam param, ArrayList<Object> triggers) {
+        final Context context = (Context) XposedHelpers.getObjectField(param.thisObject, "mContext");
         final long now = SystemClock.elapsedRealtime();
-        Context context = (Context) XposedHelpers.getObjectField(param.thisObject, "mContext");
-        long sinceReload = now - mLastReloadPrefs;
-        if (sinceReload > mReloadPrefsFrequency) {
-            setupReceiver(param);
-            m_prefs.reload();
-            UnbounceStatsCollection.getInstance().refreshPrefs(m_prefs);
-            updateStatsIfNeeded(context);
-        }
+        syncWithAmplify(param, context, now);
 
         for (int j = triggers.size() - 1; j >= 0; j--) {
             Object curAlarm = triggers.get(j);
@@ -637,11 +642,11 @@ public class Wakelocks implements IXposedHookLoadPackage {
 
             //If we're blocking this alarm
             String prefName = "alarm_" + alarmName + "_enabled";
-            boolean block = m_prefs.getBoolean(prefName, false);
+            boolean block = mLockFreePrefs.getBoolean(prefName, false);
             int overrideSeconds = -1;
             if (!block) {
                 //See if there is a wildcard block on this
-                Set<String> alarmWildcards = m_prefs.getStringSet("alarm_regex_set", null);
+                Set<String> alarmWildcards = mLockFreePrefs.getStringSet("alarm_regex_set", null);
                 if (alarmWildcards != null) {
                     //For each wildcard block
                     for (String wildcard : alarmWildcards) {
@@ -663,7 +668,7 @@ public class Wakelocks implements IXposedHookLoadPackage {
                 if (overrideSeconds != -1) {
                     collectorMaxFreq = overrideSeconds;
                 } else {
-                    collectorMaxFreq = m_prefs.getLong("alarm_" + alarmName + "_seconds", 240);
+                    collectorMaxFreq = mLockFreePrefs.getLong("alarm_" + alarmName + "_seconds", 240);
                 }
                 collectorMaxFreq *= 1000; //convert to ms
 
@@ -692,6 +697,32 @@ public class Wakelocks implements IXposedHookLoadPackage {
                 recordAlarmAcquire(context, alarmName, pi.getTargetPackage());
             }
         }
+    }
+
+    private void syncWithAmplify(final XC_MethodHook.MethodHookParam param, final Context context, final long now) {
+        synchronized (mAsyncHandlerMonitor) {
+            if (mAsyncHandlerActive) {
+                return;
+            }
+            mAsyncHandlerActive = true;
+        }
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            public Void doInBackground(Void... ignored) {
+                try {
+                    long sinceReload = now - mLastReloadPrefs;
+                    if (sinceReload > mReloadPrefsFrequency) {
+                        setupReceiver(param);
+                        reloadSettings();
+                        UnbounceStatsCollection.getInstance().refreshPrefs(m_prefs);
+                        updateStatsIfNeeded(context);
+                    }
+                    return null;
+                } finally {
+                    mAsyncHandlerActive = false;
+                }
+            }
+        }.execute();
     }
 
     private void recordWakelockBlock(XC_MethodHook.MethodHookParam param, String name, int uId) {
@@ -734,14 +765,14 @@ public class Wakelocks implements IXposedHookLoadPackage {
     }
 
     private void debugLog(String log) {
-        String curLevel = m_prefs.getString("logging_level", "default");
+        String curLevel = mLockFreePrefs.getString("logging_level", "default");
         if (curLevel.equals("verbose")) {
             XposedBridge.log(TAG + log);
         }
     }
 
     private void defaultLog(String log) {
-        String curLevel = m_prefs.getString("logging_level", "default");
+        String curLevel = mLockFreePrefs.getString("logging_level", "default");
         if (curLevel.equals("default") || curLevel.equals("verbose")) {
             XposedBridge.log(TAG + log);
         }
